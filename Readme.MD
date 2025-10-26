@@ -4,7 +4,7 @@ Detect and count people in real time to assess crowd density.
 
 Identify sudden abnormal movements indicating possible stampede.
 
-Flag harassment-like close-contact behavior using proximity rules.
+Flags close-contact behavior using proximity rules.
 
 Track and alert when a child or smaller individual separates from the group.
 
