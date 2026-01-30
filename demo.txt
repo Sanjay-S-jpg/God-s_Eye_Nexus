@@ -1,0 +1,278 @@
+# Harlin's Industrial Crowd Intelligence (PHASE 18 - THE REVIEW FINAL)
+# 
+# THE FIXES:
+# 1. FIXED POS DISPLAY: Coordinates now show up in the Intel HUD.
+# 2. SMOOTH EXIT: Proper window cleanup to prevent "Not Responding" errors.
+# 3. MOUSE ACCURACY: Ensured target locking is pixel-perfect on the resized frame.
+# 4. REPORT RELIABILITY: Report generates correctly even if the video ends early.
+
+import cv2
+from ultralytics import YOLO
+import numpy as np
+from collections import defaultdict
+import time
+import os
+
+# --- Configuration ---
+MODEL_NAME = 'yolov8s.pt' 
+CONFIDENCE_THRESHOLD = 0.30 
+WEAPON_CONF_THRESHOLD = 0.25
+PERSON_CLASS_ID = 0
+KNIFE_CLASS_ID = 43 
+
+# --- CAMERA SOURCE SELECTION ---
+# Webcam: 0 | IP Cam: "http://..." | File: "video.mp4"
+CAMERA_SOURCE = "http://192.168.1.62:8080/video" 
+
+# --- Intelligence Config ---
+GRID_SIZE = (4, 4)
+STAMPEDE_VELOCITY_THRESHOLD = 15.0
+DENSITY_LIMIT_PER_SECTOR = 4
+MAX_LOG_ENTRIES = 9 
+TARGET_DISPLAY_WIDTH = 960 
+
+# --- Global Tracking State ---
+locked_target_id = None
+mouse_click_pos = None
+target_memory = {"last_seen": 0, "box": None, "stats": {}}
+incident_log = []
+session_stats = {"start_time": time.time(), "max_crowd": 0, "weapons_found": 0, "total_detections": 0}
+
+def add_log(message):
+    global incident_log
+    timestamp = time.strftime("%H:%M:%S")
+    entry = f"[{timestamp}] {message}"
+    incident_log.insert(0, entry)
+    if len(incident_log) > MAX_LOG_ENTRIES: incident_log.pop()
+    print(entry)
+
+def mouse_handler(event, x, y, flags, param):
+    global mouse_click_pos
+    if event == cv2.EVENT_LBUTTONDOWN:
+        mouse_click_pos = (x, y)
+
+def apply_night_vision_3(frame):
+    gamma = 1.6
+    invGamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+    brightened = cv2.LUT(frame, table)
+    lab = cv2.cvtColor(brightened, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(12,12))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    return cv2.medianBlur(enhanced, 3)
+
+def generate_html_report():
+    global session_stats, incident_log
+    try:
+        duration = int(time.time() - session_stats["start_time"])
+        html_content = f"""
+        <html>
+        <head><style>
+            body {{ font-family: 'Segoe UI', sans-serif; background: #111; color: #eee; padding: 40px; }}
+            .card {{ background: #222; padding: 25px; border-radius: 12px; border-left: 6px solid #00f2ff; margin-bottom: 25px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }}
+            h1 {{ color: #00f2ff; text-transform: uppercase; letter-spacing: 3px; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+            .stat {{ font-size: 28px; font-weight: bold; color: #fff; }}
+            .log-item {{ padding: 10px; border-bottom: 1px solid #333; font-family: 'Consolas', monospace; color: #0f0; }}
+        </style></head>
+        <body>
+            <h1>Crowd Surveillance Intelligence Audit</h1>
+            <div class="card">
+                <p>Session Duration: <strong>{duration}s</strong></p>
+                <p>Peak Density: <span class="stat">{session_stats['max_crowd']} heads</span></p>
+                <p>Weapons Flagged: <span class="stat" style="color:#ff4444">{session_stats['weapons_found']}</span></p>
+            </div>
+            <h2>Activity Logs</h2>
+            <div class="card">
+                {''.join([f'<div class="log-item">{log}</div>' for log in incident_log])}
+            </div>
+        </body>
+        </html>
+        """
+        with open("final_surveillance_report.html", "w") as f: f.write(html_content)
+        print("\n[SUCCESS] Final Audit Report saved: final_surveillance_report.html")
+    except Exception as e:
+        print(f"Report generation failed: {e}")
+
+def main():
+    global locked_target_id, mouse_click_pos, target_memory, session_stats
+    source = str(CAMERA_SOURCE).strip()
+    if source.isdigit(): source = int(source)
+
+    print(f"Harlin's Intelligence System starting... Source: {source}")
+    model = YOLO(MODEL_NAME)
+    cap = cv2.VideoCapture("videos/public.mp4")
+    #cap = cv2.VideoCapture(source)
+    # Improved check: treat as stream ONLY if it looks like a network URL
+    is_stream = isinstance(source, str) and (source.startswith("http") or source.startswith("rtsp"))
+    
+    if not isinstance(source, int): cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    if not cap.isOpened():
+        print(f"FAILED to connect to source. Check your path or network, brahh.")
+        return
+
+    win_name = 'SURVEILLANCE_INTELLIGENCE_V18'
+    cv2.namedWindow(win_name)
+    cv2.setMouseCallback(win_name, mouse_handler)
+    
+    prev_positions = {}
+    sector_counts = np.zeros(GRID_SIZE)
+    all_tracked_points = []
+    night_mode = False
+    DASH_W = 320 
+
+    while True:
+        # Buffer Buster (Skip ahead for network streams only)
+        if is_stream:
+            for _ in range(3): cap.grab() 
+        
+        # Capture frame
+        ret, raw_frame = cap.retrieve() if is_stream else cap.read()
+        
+        if not ret: 
+            if is_stream:
+                print("Stream stuttering... attempting recovery.")
+                time.sleep(0.5)
+                continue
+            else:
+                print("End of video file reached. Closing cleanly.")
+                break 
+
+        # 1. PRE-PROCESSING & AI
+        h_orig, w_orig = raw_frame.shape[:2]
+        W, H = TARGET_DISPLAY_WIDTH, int(TARGET_DISPLAY_WIDTH * (h_orig/w_orig))
+        frame = cv2.resize(raw_frame, (W, H))
+
+        ai_frame = frame.copy()
+        if night_mode: ai_frame = apply_night_vision_3(ai_frame)
+
+        results = model.track(ai_frame, persist=True, verbose=False, imgsz=640, conf=CONFIDENCE_THRESHOLD)
+        
+        current_dots = []
+        weapon_count = 0
+        sector_counts.fill(0)
+        target_found_this_frame = False
+
+        if results[0].boxes.id is not None:
+            boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
+            ids = results[0].boxes.id.cpu().numpy().astype(int)
+            clss = results[0].boxes.cls.cpu().numpy().astype(int)
+            confs = results[0].boxes.conf.cpu().numpy()
+            
+            # Click detection
+            if mouse_click_pos:
+                mx, my = mouse_click_pos
+                for box, track_id, cls in zip(boxes, ids, clss):
+                    if cls == PERSON_CLASS_ID:
+                        if box[0] < mx < box[2] and box[1] < my < box[3]:
+                            locked_target_id = track_id
+                            add_log(f"MANUAL LOCK: SUBJECT {track_id}")
+                            break
+                mouse_click_pos = None
+
+            for box, track_id, cls, conf in zip(boxes, ids, clss, confs):
+                if cls == KNIFE_CLASS_ID and conf > WEAPON_CONF_THRESHOLD:
+                    weapon_count += 1
+                    session_stats["weapons_found"] += 1
+                    cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
+                    if weapon_count == 1: add_log("THREAT: WEAPON DETECTED")
+                    continue
+
+                if cls == PERSON_CLASS_ID:
+                    cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+                    head_x, head_y = cx, box[1] + 20 
+                    current_dots.append((head_x, head_y))
+                    all_tracked_points.append((head_x, head_y))
+                    session_stats["total_detections"] += 1
+
+                    sx = max(0, min(int(head_x / (W / GRID_SIZE[1])), GRID_SIZE[1]-1))
+                    sy = max(0, min(int(head_y / (H / GRID_SIZE[0])), GRID_SIZE[0]-1))
+                    sector_counts[sy, sx] += 1
+
+                    speed = 0
+                    if track_id in prev_positions:
+                        dist = np.sqrt((head_x-prev_positions[track_id][0])**2 + (head_y-prev_positions[track_id][1])**2)
+                        speed = round(dist, 1)
+                    prev_positions[track_id] = (head_x, head_y)
+
+                    if track_id == locked_target_id:
+                        target_found_this_frame = True
+                        target_memory["last_seen"] = time.time()
+                        target_memory["box"] = box
+                        target_memory["stats"] = {"id": track_id, "speed": speed, "pos": (head_x, head_y)}
+                        cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), (0, 255, 255), 3)
+
+        if len(current_dots) > session_stats["max_crowd"]: session_stats["max_crowd"] = len(current_dots)
+
+        # Persistence Logic
+        if locked_target_id and not target_found_this_frame:
+            if time.time() - target_memory["last_seen"] < 5.0:
+                b = target_memory["box"]
+                cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), (0, 165, 255), 1)
+                cv2.putText(frame, "LOST VISUAL", (b[0], b[1]-10), 1, 0.8, (0, 165, 255), 1)
+            else:
+                add_log(f"SUBJECT {locked_target_id} LOST")
+                locked_target_id = None
+
+        # 2. DASHBOARD
+        dash = np.zeros((H, DASH_W, 3), dtype=np.uint8)
+        cv2.putText(dash, "CRITICAL INTEL HUD", (20, 35), 0, 0.6, (0, 255, 255), 1)
+        cv2.line(dash, (20, 45), (300, 45), (60, 60, 60), 1)
+        cv2.putText(dash, f"LIVE COUNT: {len(current_dots)}", (20, 80), 0, 0.5, (255, 255, 255), 1)
+        cv2.putText(dash, f"WEAPONS: {weapon_count}", (20, 105), 0, 0.5, (0, 0, 255) if weapon_count > 0 else (255, 255, 255), 1)
+        
+        cv2.rectangle(dash, (15, 130), (305, 255), (30, 30, 30), -1)
+        cv2.putText(dash, "SUSPECT METADATA", (25, 150), 0, 0.5, (0, 255, 255), 1)
+        if locked_target_id:
+            s = target_memory["stats"]
+            cv2.putText(dash, f"ID: {s.get('id')}", (30, 175), 0, 0.4, (200, 200, 200), 1)
+            cv2.putText(dash, f"SPEED: {s.get('speed')} px/f", (30, 195), 0, 0.4, (0, 255, 0), 1)
+            cv2.putText(dash, f"POS: {s.get('pos')}", (30, 215), 0, 0.4, (200, 200, 200), 1) # FIXED: COORDINATES SHOWING
+        else:
+            cv2.putText(dash, "TARGETING: INACTIVE", (30, 185), 0, 0.4, (100, 100, 100), 1)
+
+        cv2.putText(dash, "ACTIVITY FEED", (20, 285), 0, 0.5, (255, 255, 0), 1)
+        for i, log in enumerate(incident_log):
+            cv2.putText(dash, log, (20, 310 + (i * 20)), 0, 0.35, (160, 160, 160), 1)
+
+        # Grid Alerts
+        for y in range(GRID_SIZE[0]):
+            for x in range(GRID_SIZE[1]):
+                x1, y1 = int(x * W/GRID_SIZE[1]), int(y * H/GRID_SIZE[0])
+                x2, y2 = int((x+1) * W/GRID_SIZE[1]), int((y+1) * H/GRID_SIZE[0])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (40, 40, 40), 1)
+                if sector_counts[y, x] >= DENSITY_LIMIT_PER_SECTOR:
+                    ov = frame.copy()
+                    cv2.rectangle(ov, (x1, y1), (x2, y2), (0, 0, 255), -1)
+                    cv2.addWeighted(ov, 0.25, frame, 0.75, 0, frame)
+
+        # 3. SHOW
+        for d in current_dots: cv2.circle(frame, d, 4, (0, 255, 0), -1)
+        main_view = ai_frame if night_mode else frame
+        cv2.imshow(win_name, np.hstack((main_view, dash)))
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'): break
+        elif key == ord('n'): night_mode = not night_mode
+        elif key == ord('r'): locked_target_id = None
+        elif key == ord('h'):
+            # Save Heatmap
+            hm_raw = np.zeros((H, W), dtype=np.float32)
+            for pt in all_tracked_points: cv2.circle(hm_raw, pt, 30, 1, -1)
+            hm_blur = cv2.GaussianBlur(hm_raw, (71, 71), 0)
+            hm_norm = cv2.normalize(hm_blur, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+            hm_color = cv2.applyColorMap(hm_norm, cv2.COLORMAP_JET)
+            cv2.imwrite(f"heatmap_{int(time.time())}.png", cv2.addWeighted(frame, 0.6, hm_color, 0.4, 0))
+
+    # FINAL CLEANUP
+    print("Shutting down engine...")
+    generate_html_report()
+    cap.release()
+    cv2.destroyAllWindows()
+    for _ in range(5): cv2.waitKey(1) # Extra kicks to ensure Windows closes the window
+
+if __name__ == "__main__":
+    main()
