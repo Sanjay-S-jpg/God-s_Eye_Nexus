@@ -1,3 +1,8 @@
 .pipfile
 .pipfile.lock
 demo.txt
+.Videos
+__pycache__/
+*.pyc
+.vscode/
+.env
