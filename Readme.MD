@@ -4,7 +4,7 @@ This project proposes an AI-powered crowd safety monitoring system that runs on 
 
 2. Identify sudden abnormal movements indicating possible stampede.
 
-Flags close-contact behavior using proximity rules.
+3. Flags close-contact behavior using proximity rules.
 
 4. Track and alert when a child or smaller individual separates from the group.
 
