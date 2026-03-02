@@ -54,6 +54,6 @@ ENABLE_DESKTOP = True
 # ============================================================
 # CAMERA SOURCE
 # ============================================================
-#CAMERA_SOURCE = "Videos/stamp.mp4"
-CAMERA_SOURCE = 0  # Webcam
+CAMERA_SOURCE = "Videos/public2.mp4"
+#CAMERA_SOURCE = 0  # Webcam
 #CAMERA_SOURCE = "http://192.168.1.62:8080/video"  # IP Camera
