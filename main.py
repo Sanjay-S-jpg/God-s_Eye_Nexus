@@ -1,21 +1,24 @@
-# main.py - Crowd Intelligence System v5.1 (COMPLETE + ENHANCED TARGET TRACKING)
+# main.py - Crowd Intelligence System v6.0 (God's Eye Nexus)
 # 
 # ALL FEATURES:
-# 1. STAMPEDE INTELLIGENCE
+# 1. STAMPEDE INTELLIGENCE v2.0 (FPS-normalized, counterflow, flow reversal)
 # 2. REAL-TIME HEATMAP
-# 3. WEAPON DETECTION (Multi-type)
-# 4. TARGET TRACKING (Enhanced with search & re-identification)
-# 5. NIGHT VISION
-# 6. DEMO MODE
-# 7. ALERTS (Desktop + Telegram)
-# 8. HTML REPORT
-# 9. PROFESSIONAL DASHBOARD
-# 10. FPS OPTIMIZED
+# 3. WEAPON DETECTION (COCO + Custom gun model)
+# 4. FIGHT/AGGRESSION DETECTION (MediaPipe Pose)
+# 5. TARGET TRACKING (Enhanced with search & re-identification)
+# 6. NIGHT VISION
+# 7. DEMO MODE
+# 8. ALERTS (Desktop + Telegram)
+# 9. HTML REPORT
+# 10. PROFESSIONAL DASHBOARD
+# 11. GPU AUTO-DETECT + ADAPTIVE FPS
+# 12. PEOPLE COUNT TREND (rise/drop)
 #
 # CONTROLS:
 # Q - Quit | N - Night Vision | M - Heatmap | H - Save Heatmap
 # R - Reset Target | T - Test Alerts | D - Demo Mode
 # 1,2,3 - Demo Scenarios (press D first!) | C - Clear Heatmap
+# B - Toggle Bounding Boxes | F - Toggle Fight Detection
 
 import cv2
 from ultralytics import YOLO
@@ -24,22 +27,25 @@ import time
 import os
 import platform
 import base64
+from collections import deque
 
 from config import *
 from stampede_intel import StampedeDetector, DemoDataGenerator, HeatmapGenerator, PersonTracker
 from alerts import AlertManager
 from weapon_detector_v2 import WeaponDetectorV2
+from fight_detector import FightDetector, MEDIAPIPE_AVAILABLE
 
 # --- Global State ---
 locked_target_id = None
 mouse_click_pos = None
 target_memory = {"last_seen": 0, "box": None, "stats": {}}
 incident_log = []
+people_count_history = deque(maxlen=90)  # Track people count for trend analysis
 session_stats = {
     "start_time": time.time(),
     "max_crowd": 0,
     "weapons_found": 0,
-    "total_detections": 0,
+    "fights_detected": 0,
     "max_stampede_risk": 0,
     "fps_list": [],
     "total_persons_tracked": 0
@@ -76,14 +82,15 @@ def apply_night_vision(frame):
     return cv2.medianBlur(enhanced, 3)
 
 
-def generate_html_report(heatmap_base64=None, stampede_data=None):
+def generate_html_report(heatmap_base64=None, stampede_data=None, fight_data=None):
     """Creates a professional HTML report"""
     global session_stats, incident_log
     try:
         duration = int(time.time() - session_stats["start_time"])
         avg_fps = round(np.mean(session_stats["fps_list"]), 1) if session_stats["fps_list"] else "N/A"
         
-        base_risk = (session_stats["max_crowd"] * 3) + (session_stats["weapons_found"] * 30)
+        fights = fight_data.get('fights_detected', 0) if fight_data else 0
+        base_risk = (session_stats["max_crowd"] * 3) + (session_stats["weapons_found"] * 30) + (fights * 15)
         stampede_risk = session_stats.get("max_stampede_risk", 0)
         risk_score = min(100, base_risk + stampede_risk)
         
@@ -124,6 +131,11 @@ def generate_html_report(heatmap_base64=None, stampede_data=None):
                 <span class="stat-val">{session_stats.get('total_persons_tracked', 0)}</span>
                 <p style="font-size:12px; margin-top:10px;">Unique individuals identified.</p>
             </div>
+            <div class="card">
+                <span style="color:#666; text-transform: uppercase; font-size: 11px; font-weight:700;">Fights Detected</span>
+                <span class="stat-val" style="color: {'#ff4444' if fights > 0 else '#00ff88'};">{fights}</span>
+                <p style="font-size:12px; margin-top:10px;">Physical altercation events detected.</p>
+            </div>
         </div>
         """
 
@@ -134,6 +146,8 @@ def generate_html_report(heatmap_base64=None, stampede_data=None):
                 color = "#ff9500"
             if "WEAPON" in log:
                 color = "#ff4444"
+            if "FIGHT" in log:
+                color = "#ff6600"
             if "TARGET" in log:
                 color = "#00f2ff"
             log_entries += f'<div class="log-entry" style="color:{color};">{log}</div>'
@@ -230,19 +244,45 @@ def generate_html_report(heatmap_base64=None, stampede_data=None):
 
 
 def main():
-    global locked_target_id, mouse_click_pos, target_memory, session_stats
+    global locked_target_id, mouse_click_pos, target_memory, session_stats, people_count_history
 
     print("\n" + "=" * 60)
-    print("  CROWD INTELLIGENCE SYSTEM v5.1")
-    print("  Enhanced Target Tracking Edition")
+    print("  GOD'S EYE NEXUS - Crowd Intelligence System v6.0")
+    print("  Stampede | Weapons | Fight Detection | Target Tracking")
     print("=" * 60)
-    print(f"\n[CONFIG] Model: {MODEL_NAME} | AI Size: {AI_INPUT_SIZE}px")
-    print(f"[CONFIG] Frame Skip: Process every {PROCESS_EVERY_N_FRAMES} frames")
+    
+    # --- GPU Auto-Detection ---
+    device = 'cpu'
+    if GPU_AUTO_DETECT:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device = 'cuda'
+                gpu_name = torch.cuda.get_device_name(0)
+                print(f"[GPU] CUDA detected: {gpu_name}")
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                device = 'mps'
+                print("[GPU] Apple MPS detected")
+            else:
+                print("[GPU] No GPU found, using CPU")
+        except ImportError:
+            print("[GPU] PyTorch not available for GPU check, using CPU")
+    
+    if GPU_ONLY and device == 'cpu':
+        print("[ERROR] GPU_ONLY is enabled but no GPU was detected.")
+        print("[INFO] Please run on a machine with CUDA GPU. Exiting.")
+        return
+    
+    print(f"\n[CONFIG] Model: {MODEL_NAME} | Device: {device.upper()} | AI Size: {AI_INPUT_SIZE}px")
+    print(f"[CONFIG] Frame Skip: {PROCESS_EVERY_N_FRAMES} (adaptive: {ADAPTIVE_FRAME_SKIP})")
+    print(f"[CONFIG] Fight Detection: {'ON' if FIGHT_DETECTION_ENABLED and MEDIAPIPE_AVAILABLE else 'OFF'}")
+    print(f"[CONFIG] Gun Model: {WEAPON_MODEL_PATH if os.path.exists(WEAPON_MODEL_PATH) else 'Not found (COCO-only)'}")
     print("\nCONTROLS:")
     print("  Q - Quit              N - Night Vision")
     print("  M - Heatmap Toggle    H - Save Heatmap")
     print("  R - Reset Target      T - Test Alerts")
     print("  D - Demo Mode         C - Clear Heatmap")
+    print("  B - Bounding Boxes    F - Fight Detection")
     print("  1,2,3 - Demo Scenarios (press D first!)")
     print("=" * 60 + "\n")
 
@@ -252,6 +292,22 @@ def main():
     is_stream = isinstance(source, str) and source.startswith("http")
     is_webcam = isinstance(source, int)
 
+    # If source points to a directory, pick the first video file
+    if is_file and os.path.isdir(source):
+        try:
+            exts = (".mp4", ".mkv", ".avi", ".mov", ".webm")
+            entries = sorted(os.listdir(source))
+            video_files = [f for f in entries if f.lower().endswith(exts)]
+            if len(video_files) > 0:
+                source = os.path.join(source, video_files[0])
+                print(f"[INFO] Using video: {source}")
+            else:
+                print(f"[ERROR] No video files found in folder: {CAMERA_SOURCE}")
+                source, is_file, is_webcam = 0, False, True
+        except Exception as e:
+            print(f"[ERROR] Failed to read folder '{CAMERA_SOURCE}': {e}")
+            source, is_file, is_webcam = 0, False, True
+
     if is_file and not os.path.exists(source):
         print(f"[ERROR] Video not found: {source}, using webcam")
         source, is_file, is_webcam = 0, False, True
@@ -259,6 +315,9 @@ def main():
     # Load model
     print(f"[INFO] Loading {MODEL_NAME}...")
     model = YOLO(MODEL_NAME)
+    if device != 'cpu':
+        model.to(device)
+        print(f"[INFO] Model moved to {device.upper()}")
     print("[INFO] Model loaded!")
 
     # Open video
@@ -270,7 +329,7 @@ def main():
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if is_file else 0
     
     # Window setup
-    win_name = 'CROWD INTELLIGENCE v5.1'
+    win_name = 'GOD\'S EYE NEXUS v6.0'
     cv2.namedWindow(win_name)
     cv2.setMouseCallback(win_name, mouse_handler)
 
@@ -280,14 +339,29 @@ def main():
     heatmap_gen = None
     person_tracker = PersonTracker(max_lost_frames=30)
     alert_manager = AlertManager(cooldown=ALERT_COOLDOWN, enable_telegram=ENABLE_TELEGRAM, enable_desktop=ENABLE_DESKTOP)
-        # Enhanced weapon detector with context awareness
+    
+    # Weapon detector with custom gun model support
     weapon_detector = WeaponDetectorV2(
         alert_cooldown=5.0,
-        proximity_threshold=150,  # Weapon must be within 150px of person for high threat
-        min_weapon_size=15,       # Minimum 15px to detect small weapons
-        max_weapon_size=500,      # Maximum size to filter false positives
-        require_person_nearby=False  # Set True to only alert when weapon near person
+        proximity_threshold=150,
+        min_weapon_size=15,
+        max_weapon_size=500,
+        require_person_nearby=False,
+        weapon_model_path=WEAPON_MODEL_PATH
     )
+    
+    # Fight detector (MediaPipe Pose)
+    fight_detector = None
+    fight_result = {'fights': [], 'aggressive_persons': {}, 'fight_count': 0, 'new_alerts': []}
+    if FIGHT_DETECTION_ENABLED and MEDIAPIPE_AVAILABLE:
+        fight_detector = FightDetector(
+            proximity_threshold=FIGHT_PROXIMITY_THRESHOLD,
+            aggression_threshold=FIGHT_AGGRESSION_THRESHOLD,
+            analysis_interval=FIGHT_ANALYSIS_INTERVAL
+        )
+        print("[INFO] Fight Detection: ENABLED")
+    else:
+        print("[INFO] Fight Detection: DISABLED")
     
     print("[INFO] All systems initialized!")
 
@@ -296,17 +370,25 @@ def main():
     heatmap_mode = False
     demo_mode = False
     demo_gen = None
+    show_boxes = False           # Toggle person bounding boxes
+    fight_mode = FIGHT_DETECTION_ENABLED and MEDIAPIPE_AVAILABLE
     frame_count = 0
     prev_time = time.time()
     last_valid_frame = None
     weapon_count = 0
-    fps = 30  # Initialize fps
+    fight_count = 0
+    fps = 30
+    time_delta = 1.0 / 30.0
+    process_every_n = PROCESS_EVERY_N_FRAMES  # Adaptive frame skip (mutable)
+    child_alone_counts = {}
+    kids_alone_count = 0
     
     # Cache for frame skipping
     cached_boxes = []
     cached_ids = []
     cached_clss = []
     cached_confs = []
+    cached_person_boxes = []     # Only person bounding boxes
 
     sector_counts = np.zeros(GRID_SIZE)
 
@@ -325,11 +407,19 @@ def main():
                 break
             continue
 
-        # FPS
+        # FPS + Time Delta (for FPS-normalized calculations)
         curr_time = time.time()
-        fps = 1 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 30
+        time_delta = curr_time - prev_time if (curr_time - prev_time) > 0 else 1.0 / 30.0
+        fps = 1.0 / time_delta
         session_stats["fps_list"].append(fps)
         prev_time = curr_time
+        
+        # Adaptive frame skip — auto-adjust based on current FPS
+        if ADAPTIVE_FRAME_SKIP and frame_count % 30 == 0:
+            if fps < TARGET_FPS * 0.7:
+                process_every_n = min(MAX_FRAME_SKIP, process_every_n + 1)
+            elif fps > TARGET_FPS * 1.3 and process_every_n > MIN_FRAME_SKIP:
+                process_every_n = max(MIN_FRAME_SKIP, process_every_n - 1)
 
         # Resize
         h_orig, w_orig = raw_frame.shape[:2]
@@ -349,6 +439,7 @@ def main():
         current_positions = {}
         current_boxes = {}
         weapon_count = 0
+        fight_count = 0
         sector_counts.fill(0)
         target_found_this_frame = False
 
@@ -368,12 +459,12 @@ def main():
 
         # --- REAL MODE ---
         else:
-            run_ai = (frame_count % PROCESS_EVERY_N_FRAMES == 0)
+            run_ai = (frame_count % process_every_n == 0)
 
             if run_ai:
                 ai_h = int(AI_INPUT_SIZE * (H / W))
                 ai_small = cv2.resize(ai_frame, (AI_INPUT_SIZE, ai_h))
-                results = model.track(ai_small, persist=True, verbose=False, imgsz=AI_INPUT_SIZE, conf=CONFIDENCE_THRESHOLD)
+                results = model.track(ai_small, persist=True, verbose=False, imgsz=AI_INPUT_SIZE, conf=CONFIDENCE_THRESHOLD, tracker="bytetrack.yaml")
 
                 if results[0].boxes.id is not None:
                     scale_x, scale_y = W / AI_INPUT_SIZE, H / ai_h
@@ -384,10 +475,17 @@ def main():
                     cached_confs = results[0].boxes.conf.cpu().numpy()
                 else:
                     cached_boxes, cached_ids, cached_clss, cached_confs = [], [], [], []
+                    cached_person_boxes = []
 
             if len(cached_boxes) > 0:
                 tracked = person_tracker.update(cached_boxes, cached_ids, ai_frame)
-                session_stats['total_persons_tracked'] = len(person_tracker.tracked_persons)
+                session_stats['total_persons_tracked'] = person_tracker.get_total_unique()
+                
+                # Build person-only boxes list (for weapon detector)
+                cached_person_boxes = []
+                for box, cls in zip(cached_boxes, cached_clss):
+                    if int(cls) == PERSON_CLASS_ID:
+                        cached_person_boxes.append(box)
 
                 # Mouse click
                 if mouse_click_pos:
@@ -417,6 +515,12 @@ def main():
                         speed = 0
                         if track_id in person_tracker.tracked_persons:
                             speed = round(person_tracker.tracked_persons[track_id]['speed'], 1)
+                        
+                        # Draw person bounding box if enabled
+                        if show_boxes and track_id != locked_target_id:
+                            cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), (0, 200, 0), 1)
+                            cv2.putText(frame, f"#{track_id}", (box[0], box[1] - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 200, 0), 1)
 
                         # Target tracking - when found
                         if track_id == locked_target_id:
@@ -450,13 +554,13 @@ def main():
                             cv2.putText(frame, f"TARGET #{track_id}", (box[0] + 5, box[1] - 10),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
-                # === WEAPON DETECTION ===
-                               # === WEAPON DETECTION (Enhanced) ===
+                # === WEAPON DETECTION (COCO + Custom Gun Model) ===
                 weapon_result = weapon_detector.process_frame(
                     cached_boxes, 
                     cached_clss, 
                     cached_confs,
-                    person_boxes=cached_boxes  # Pass all boxes for person detection
+                    person_boxes=cached_person_boxes,  # Only person boxes (fixed bug)
+                    frame=ai_frame  # Pass frame for custom gun model inference
                 )
                 if weapon_result['weapons']:
                     frame = weapon_detector.draw_detections(frame)
@@ -465,18 +569,69 @@ def main():
                         session_stats["weapons_found"] += 1
                         add_log(f"WEAPON: {weapon['type']} ({weapon['danger']})")
                         alert_manager.weapon_alert(weapon['type'], frame=frame)
+                
+                # === FIGHT DETECTION (MediaPipe Pose) ===
+                if fight_mode and fight_detector and len(current_positions) >= 2:
+                    fight_result = fight_detector.process_frame(
+                        ai_frame, current_boxes, current_positions
+                    )
+                    fight_count = fight_result['fight_count']
+                    
+                    if fight_result['fights']:
+                        frame = fight_detector.draw_detections(frame, current_positions)
+                    
+                    for fight in fight_result.get('new_alerts', []):
+                        session_stats['fights_detected'] += 1
+                        severity = fight['severity']
+                        add_log(f"FIGHT: Severity {int(severity*100)}% (#{fight['person1']} vs #{fight['person2']})")
+                        alert_manager.fight_alert(severity, fight['person1'], fight['person2'], frame=frame)
 
+                # === KIDS-ALONE DETECTION ===
+                if len(current_boxes) >= 1:
+                    heights = [b[3] - b[1] for b in current_boxes.values()]
+                    if heights:
+                        median_h = float(np.median(heights))
+                        alone_radius = 120
+                        kids_alone_count = 0
+                        for tid, box in current_boxes.items():
+                            h = box[3] - box[1]
+                            is_child = h < median_h * 0.65
+                            if not is_child:
+                                child_alone_counts[tid] = max(0, child_alone_counts.get(tid, 0) - 1)
+                                continue
+                            cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+                            near = 0
+                            for oid, (ox, oy) in current_positions.items():
+                                if oid == tid:
+                                    continue
+                                if np.hypot(cx - ox, cy - oy) < alone_radius:
+                                    near += 1
+                            alone = near == 0
+                            key = tid
+                            if alone:
+                                child_alone_counts[key] = child_alone_counts.get(key, 0) + 1
+                                if child_alone_counts[key] >= 10:
+                                    kids_alone_count += 1
+                                    cv2.circle(frame, (cx, cy), 22, (255, 0, 255), 2)
+                                    cv2.putText(frame, "CHILD", (box[0], box[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+                                    if child_alone_counts[key] == 10:
+                                        add_log(f"CHILD ALONE: #{tid}")
+                                        alert_manager.custom_alert("CHILD ALONE", f"Suspected child alone detected (ID #{tid})", alert_type="child", frame=frame)
+                            else:
+                                child_alone_counts[key] = max(0, child_alone_counts.get(key, 0) - 2)
         # Stats
         if len(current_dots) > session_stats["max_crowd"]:
             session_stats["max_crowd"] = len(current_dots)
 
-        # Heatmap
-        if heatmap_gen and len(current_positions) > 0:
+        # Heatmap — always update (so trails decay even when no one visible)
+        if heatmap_gen:
             heatmap_gen.update(current_positions, current_boxes)
 
-        # Stampede
+        # Stampede (pass time_delta for FPS-normalized velocities)
         if len(current_positions) >= 2:
-            stampede_result = stampede_detector.update(current_positions, sector_counts, (W, H))
+            stampede_result = stampede_detector.update(
+                current_positions, sector_counts, (W, H), time_delta=time_delta
+            )
             if stampede_result['risk_score'] > session_stats.get('max_stampede_risk', 0):
                 session_stats['max_stampede_risk'] = stampede_result['risk_score']
             if stampede_result['alert_level'] >= 2:
@@ -484,10 +639,24 @@ def main():
                     add_log(f"STAMPEDE RISK: {stampede_result['risk_score']}%")
                 alert_manager.stampede_alert(stampede_result['risk_score'], stampede_result['alert_level'], frame=frame)
 
-        # Crowd alert
+        # Crowd alert + people count trend
         people_count = len(current_dots)
+        people_count_history.append(people_count)
         if people_count > CROWD_DENSITY_ALERT_THRESHOLD:
             alert_manager.crowd_density_alert(people_count, CROWD_DENSITY_ALERT_THRESHOLD, frame=frame)
+        
+        # Calculate people count trend
+        people_trend = "->"  # stable
+        if len(people_count_history) > 15:
+            recent_avg = np.mean(list(people_count_history)[-10:])
+            older_avg = np.mean(list(people_count_history)[:10])
+            if older_avg > 0:
+                if recent_avg > older_avg * 1.25:
+                    people_trend = "UP"
+                elif recent_avg < older_avg * 0.75:
+                    people_trend = "DN"
+                else:
+                    people_trend = "->"
 
         # ============================================================
         # ENHANCED TARGET TRACKING - Lost Target Handling
@@ -603,6 +772,10 @@ def main():
         if weapon_detector.active_weapons:
             display_frame = weapon_detector.draw_alert_banner(display_frame)
 
+        # Fight alert banner
+        if fight_detector and fight_detector.active_fights:
+            display_frame = fight_detector.draw_alert_banner(display_frame)
+
         # Dots
         for d in current_dots:
             cv2.circle(display_frame, d, 5, (0, 255, 0), -1)
@@ -651,18 +824,23 @@ def main():
         cv2.rectangle(dash, (10, y), (DASH_W - 10, y + 75), (50, 50, 55), 1)
         cv2.putText(dash, "LIVE STATISTICS", (20, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
 
-        # People count
+        # People count with trend
         cv2.putText(dash, f"People: {people_count}", (20, y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(dash, f"(Peak: {session_stats['max_crowd']})", (130, y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
+        trend_color = (0, 200, 0) if people_trend == "->" else (0, 165, 255) if people_trend == "UP" else (255, 100, 100)
+        cv2.putText(dash, people_trend, (130, y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, trend_color, 1)
+        cv2.putText(dash, f"(Peak: {session_stats['max_crowd']})", (175, y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
 
-        # FPS, Weapons, Tracked
+        # FPS, Weapons, Fights
         fps_color = (0, 255, 0) if fps > 20 else (0, 255, 255) if fps > 10 else (0, 0, 255)
         cv2.putText(dash, f"FPS: {int(fps)}", (20, y + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.45, fps_color, 1)
         
         w_color = (0, 0, 255) if weapon_count > 0 else (0, 255, 0)
         cv2.putText(dash, f"Weapons: {weapon_count}", (100, y + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.45, w_color, 1)
         
-        cv2.putText(dash, f"Tracked: {session_stats['total_persons_tracked']}", (220, y + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        f_color = (0, 0, 255) if fight_count > 0 else (0, 255, 0)
+        cv2.putText(dash, f"Fights: {fight_count}", (220, y + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.45, f_color, 1)
+        kid_color = (0, 0, 255) if kids_alone_count > 0 else (0, 255, 0)
+        cv2.putText(dash, f"Kids: {kids_alone_count}", (300, y + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.45, kid_color, 1)
 
         y += 85
 
@@ -696,11 +874,11 @@ def main():
 
         # Component vertical bars
         components = stampede_result.get('components', {})
-        comp_names = ['COHER', 'ACCEL', 'SPEED', 'SPIKE', 'EDGE']
-        comp_keys = ['coherence', 'acceleration', 'avg_speed', 'spike', 'edge']
+        comp_names = ['COHR', 'ACEL', 'SPD', 'SPKE', 'EDGE', 'CFLW', 'RVRS']
+        comp_keys = ['coherence', 'acceleration', 'avg_speed', 'spike', 'edge', 'counterflow', 'flow_reversal']
         
         comp_start_y = y + 78
-        comp_spacing = 68
+        comp_spacing = 49
         
         for i, (name, key) in enumerate(zip(comp_names, comp_keys)):
             value = components.get(key, 0)
@@ -812,7 +990,7 @@ def main():
         cv2.rectangle(dash, (10, y), (DASH_W - 10, y + 30), (30, 30, 35), -1)
         mode_x = 20
         
-        for mode_name, is_on in [("DEMO", demo_mode), ("NIGHT", night_mode), ("HEAT", heatmap_mode)]:
+        for mode_name, is_on in [("DEMO", demo_mode), ("NIGHT", night_mode), ("HEAT", heatmap_mode), ("BBOX", show_boxes), ("FIGHT", fight_mode)]:
             color = (0, 255, 255) if is_on else (50, 50, 55)
             text_color = (0, 0, 0) if is_on else (80, 80, 80)
             cv2.rectangle(dash, (mode_x, y + 5), (mode_x + 50, y + 25), color, -1 if is_on else 1)
@@ -844,6 +1022,8 @@ def main():
                 color = (0, 165, 255)
             if "WEAPON" in log:
                 color = (0, 0, 255)
+            if "FIGHT" in log:
+                color = (0, 80, 255)
             if "TARGET" in log:
                 color = (0, 255, 255)
             if "RE-ACQUIRED" in log or "RE-IDENTIFIED" in log:
@@ -858,7 +1038,7 @@ def main():
         cv2.line(dash, (10, H - 28), (DASH_W - 10, H - 28), (50, 50, 55), 1)
         runtime = int(time.time() - session_stats['start_time'])
         cv2.putText(dash, f"Runtime: {runtime // 60}m {runtime % 60}s", (15, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (100, 100, 100), 1)
-        cv2.putText(dash, "Q=Quit T=Test", (DASH_W - 95, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (100, 100, 100), 1)
+        cv2.putText(dash, "B=Box F=Fight", (DASH_W - 105, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (100, 100, 100), 1)
 
         # Bottom tip on main frame
         if locked_target_id:
@@ -930,6 +1110,12 @@ def main():
                             heatmap_gen.get_heatmap_overlay(last_valid_frame, alpha=0.6, grayscale_bg=True))
                 add_log("Saved 3 heatmaps to Pictures/")
                 print(f"[SAVED] 3 heatmaps to Pictures/ folder")
+        elif key == ord('b'):
+            show_boxes = not show_boxes
+            add_log(f"Bounding Boxes: {'ON' if show_boxes else 'OFF'}")
+        elif key == ord('f'):
+            fight_mode = not fight_mode
+            add_log(f"Fight Detection: {'ON' if fight_mode else 'OFF'}")
 
     # ============================================================
     # SESSION END - Generate Report
@@ -952,7 +1138,8 @@ def main():
     # Generate HTML report
     generate_html_report(
         heatmap_base64=heatmap_base64, 
-        stampede_data={'max_risk': session_stats.get('max_stampede_risk', 0)}
+        stampede_data={'max_risk': session_stats.get('max_stampede_risk', 0)},
+        fight_data={'fights_detected': session_stats.get('fights_detected', 0)}
     )
 
     # Cleanup
@@ -968,6 +1155,7 @@ def main():
     print(f"  Average FPS:      {avg_fps:.1f}")
     print(f"  Max Crowd:        {session_stats['max_crowd']} people")
     print(f"  Weapons Found:    {session_stats['weapons_found']}")
+    print(f"  Fights Detected:  {session_stats['fights_detected']}")
     print(f"  Max Stampede:     {session_stats['max_stampede_risk']}%")
     print(f"  Persons Tracked:  {session_stats['total_persons_tracked']}")
     print(f"{'=' * 50}")

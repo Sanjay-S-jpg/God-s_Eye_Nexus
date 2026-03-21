@@ -1,15 +1,20 @@
-# weapon_detector_v2.py - Advanced Weapon Detection System v2.0
+# weapon_detector_v2.py - Advanced Weapon Detection System v3.0
 # 
 # Features:
 # - Multiple weapon types (knife, scissors, bat, etc.)
+# - Custom YOLO model support for gun/firearm detection
 # - Small object detection enhancement
 # - Context awareness (person holding weapon = higher threat)
 # - Threat zone visualization
 # - Reduced false positives
+#
+# COCO Class IDs (YOLOv8):
+#   34=baseball bat, 39=bottle, 43=knife, 76=scissors
 
 import cv2
 import numpy as np
 import time
+import os
 from collections import defaultdict
 
 
@@ -29,20 +34,20 @@ class WeaponDetectorV2:
     - Calculates threat level
     """
     
-    # YOLO COCO class IDs for potential weapons
+    # YOLO COCO class IDs for potential weapons (CORRECTED for YOLOv8)
     WEAPON_CLASSES = {
         43: {"name": "Knife", "danger": "HIGH", "color": (0, 0, 255), "min_conf": 0.25},
         76: {"name": "Scissors", "danger": "MEDIUM", "color": (0, 165, 255), "min_conf": 0.30},
-        39: {"name": "Baseball Bat", "danger": "MEDIUM", "color": (0, 165, 255), "min_conf": 0.35},
-        44: {"name": "Bottle", "danger": "LOW", "color": (0, 255, 255), "min_conf": 0.40},
+        34: {"name": "Baseball Bat", "danger": "MEDIUM", "color": (0, 165, 255), "min_conf": 0.35},
+        39: {"name": "Bottle", "danger": "LOW", "color": (0, 255, 255), "min_conf": 0.40},
     }
     
-    # Classes to IGNORE (common false positives)
+    # Classes to IGNORE (common false positives) — CORRECTED IDs
     IGNORE_CLASSES = {
         38: "Tennis Racket",
-        40: "Skateboard", 
-        41: "Surfboard",
-        52: "Banana",  # Often detected as knife
+        36: "Skateboard",
+        37: "Surfboard",
+        46: "Banana",  # Often detected as knife
     }
     
     PERSON_CLASS_ID = 0
@@ -52,7 +57,8 @@ class WeaponDetectorV2:
                  proximity_threshold=150,
                  min_weapon_size=15,
                  max_weapon_size=500,
-                 require_person_nearby=False):
+                 require_person_nearby=False,
+                 weapon_model_path=None):
         """
         Args:
             alert_cooldown: Seconds between alerts for same weapon
@@ -60,6 +66,7 @@ class WeaponDetectorV2:
             min_weapon_size: Minimum pixel size to detect (filters noise)
             max_weapon_size: Maximum pixel size (filters large false positives)
             require_person_nearby: If True, only alert when weapon is near a person
+            weapon_model_path: Path to custom YOLO model for gun/firearm detection (optional)
         """
         self.alert_cooldown = alert_cooldown
         self.proximity_threshold = proximity_threshold
@@ -72,10 +79,27 @@ class WeaponDetectorV2:
         self.active_weapons = []
         self.weapon_history = []
         self.frame_count = 0
+        self.seen_counts = {}
         
         # Person positions (updated each frame)
         self.person_positions = []
         self.person_boxes = []
+        
+        # Custom weapon model for gun detection
+        self.gun_model = None
+        self.gun_model_classes = {}
+        if weapon_model_path and os.path.exists(weapon_model_path):
+            try:
+                from ultralytics import YOLO
+                self.gun_model = YOLO(weapon_model_path)
+                self.gun_model_classes = self.gun_model.names
+                print(f"[INFO] Custom weapon model loaded: {weapon_model_path}")
+                print(f"[INFO] Gun model classes: {self.gun_model_classes}")
+            except Exception as e:
+                print(f"[WARN] Failed to load custom weapon model: {e}")
+        elif weapon_model_path:
+            print(f"[INFO] Custom weapon model not found: {weapon_model_path}")
+            print(f"[INFO] Gun detection disabled. Place a YOLO weapon model at: {weapon_model_path}")
     
     def _get_box_center(self, box):
         """Get center point of bounding box"""
@@ -157,6 +181,7 @@ class WeaponDetectorV2:
         Returns: float (0.0 to 1.0)
         """
         base_threat = {
+            'CRITICAL': 0.85,
             'HIGH': 0.7,
             'MEDIUM': 0.4,
             'LOW': 0.2
@@ -178,7 +203,69 @@ class WeaponDetectorV2:
         
         return min(1.0, max(0.0, threat))
     
-    def process_frame(self, boxes, classes, confidences, person_boxes=None):
+    def _detect_with_custom_model(self, frame):
+        """
+        Run custom weapon detection model (for guns/firearms).
+        Returns list of weapon_data dicts.
+        """
+        if self.gun_model is None or frame is None:
+            return []
+        
+        custom_weapons = []
+        try:
+            results = self.gun_model(frame, verbose=False, conf=0.30, imgsz=640)
+            
+            for result in results:
+                if result.boxes is None or len(result.boxes) == 0:
+                    continue
+                
+                for box, cls_t, conf_t in zip(
+                    result.boxes.xyxy.cpu().numpy(),
+                    result.boxes.cls.cpu().numpy(),
+                    result.boxes.conf.cpu().numpy()
+                ):
+                    class_name = self.gun_model_classes.get(int(cls_t), "Weapon")
+                    
+                    # Determine danger level from class name
+                    name_lower = class_name.lower()
+                    if any(w in name_lower for w in ["gun", "pistol", "rifle", "firearm", "revolver"]):
+                        danger = "CRITICAL"
+                        color = (0, 0, 255)
+                    elif any(w in name_lower for w in ["knife", "blade", "sword", "machete"]):
+                        danger = "HIGH"
+                        color = (0, 0, 255)
+                    else:
+                        danger = "HIGH"
+                        color = (0, 100, 255)
+                    
+                    box_int = tuple([int(b) for b in box])
+                    center = self._get_box_center(box_int)
+                    width, height = self._get_box_size(box_int)
+                    near_person = self._is_near_person(center)
+                    
+                    weapon_data = {
+                        'type': class_name.title(),
+                        'danger': danger,
+                        'color': color,
+                        'box': box_int,
+                        'center': center,
+                        'size': (width, height),
+                        'confidence': float(conf_t),
+                        'class_id': int(cls_t),
+                        'near_person': near_person,
+                        'held_position': False,
+                        'distance_to_person': None,
+                        'frame': self.frame_count,
+                        'source': 'custom_model'
+                    }
+                    weapon_data['threat_level'] = self._calculate_threat_level(weapon_data)
+                    custom_weapons.append(weapon_data)
+        except Exception as e:
+            print(f"[WARN] Custom weapon model error: {e}")
+        
+        return custom_weapons
+    
+    def process_frame(self, boxes, classes, confidences, person_boxes=None, frame=None):
         """
         Process a frame and detect weapons with context.
         
@@ -186,7 +273,8 @@ class WeaponDetectorV2:
             boxes: All detected bounding boxes
             classes: Class IDs for each box
             confidences: Confidence scores
-            person_boxes: Optional - boxes of detected persons
+            person_boxes: Bounding boxes of detected PERSONS ONLY
+            frame: Original frame for custom gun model inference (optional)
             
         Returns:
             dict with weapon detections and alerts
@@ -194,11 +282,16 @@ class WeaponDetectorV2:
         self.frame_count += 1
         current_time = time.time()
         
-        # Update person positions
+        # Update person positions — use person_boxes if provided, otherwise filter from all boxes
         self.person_positions = []
         self.person_boxes = []
         
-        if len(boxes) > 0:
+        if person_boxes is not None and len(person_boxes) > 0:
+            for box in person_boxes:
+                center = self._get_box_center(box)
+                self.person_positions.append(center)
+                self.person_boxes.append(box)
+        elif len(boxes) > 0:
             for box, cls in zip(boxes, classes):
                 if int(cls) == self.PERSON_CLASS_ID:
                     center = self._get_box_center(box)
@@ -253,6 +346,8 @@ class WeaponDetectorV2:
                     held_position = True
             
             # Build weapon data
+            key = (cls, center[0] // 20, center[1] // 20)
+            self.seen_counts[key] = self.seen_counts.get(key, 0) + 1
             weapon_data = {
                 'type': weapon_info['name'],
                 'danger': weapon_info['danger'],
@@ -271,6 +366,10 @@ class WeaponDetectorV2:
             # Calculate threat level
             weapon_data['threat_level'] = self._calculate_threat_level(weapon_data)
             
+            low_conf = weapon_data['confidence'] < 0.35
+            persistent = self.seen_counts.get(key, 0) >= (2 if low_conf else 1)
+            if not persistent:
+                continue
             self.active_weapons.append(weapon_data)
             
             # Check cooldown for alerts
@@ -286,6 +385,23 @@ class WeaponDetectorV2:
                         **weapon_data,
                         'timestamp': current_time
                     })
+        
+        # --- Run custom gun model if available ---
+        if self.gun_model is not None and frame is not None:
+            custom_weapons = self._detect_with_custom_model(frame)
+            for weapon_data in custom_weapons:
+                self.active_weapons.append(weapon_data)
+                # Alert for custom model detections
+                weapon_key = f"gun_{weapon_data['center'][0]//100}_{weapon_data['center'][1]//100}"
+                last_time = self.last_alert_time.get(weapon_key, 0)
+                if current_time - last_time > self.alert_cooldown:
+                    if weapon_data['threat_level'] > 0.2:
+                        self.last_alert_time[weapon_key] = current_time
+                        new_alerts.append(weapon_data)
+                        self.weapon_history.append({
+                            **weapon_data,
+                            'timestamp': current_time
+                        })
         
         return {
             'weapons': self.active_weapons,

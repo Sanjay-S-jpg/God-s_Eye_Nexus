@@ -4,6 +4,14 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
+ultralytics = "*"
+opencv-python = "*"
+numpy = "*"
+requests = "*"
+plyer = "*"
+mediapipe = "*"
+python-dotenv = "*"
+torch = "*"
 
 [dev-packages]
 

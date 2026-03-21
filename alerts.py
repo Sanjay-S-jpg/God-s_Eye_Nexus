@@ -1,5 +1,8 @@
 # alerts.py - Alert System (Desktop + Telegram)
-# For Sanjay's Crowd Intelligence Project
+# For God's Eye Nexus - Crowd Intelligence System
+#
+# Supports: Desktop notifications, Telegram messages/photos, fight alerts
+# Tokens loaded from .env via config.py for security
 
 import os
 import time
@@ -9,18 +12,8 @@ import cv2
 import numpy as np
 from datetime import datetime
 
-# ============================================================
-# TELEGRAM CONFIGURATION
-# ============================================================
-# To get these:
-# 1. Message @BotFather on Telegram, type /newbot
-# 2. Follow instructions, get the BOT TOKEN
-# 3. Message your bot, then visit:
-#    https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
-# 4. Find your chat_id in the response
-
-TELEGRAM_BOT_TOKEN = "8463495985:AAH9i5MQ8EZo6CeKxpRCHoA_WmjrD5OiXgY"  # Replace with your token
-TELEGRAM_CHAT_ID = "1076041557"      # Replace with your chat ID
+# Import Telegram credentials from central config (loaded from .env)
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 # ============================================================
 # ALERT SETTINGS
@@ -62,8 +55,8 @@ def send_telegram_message(message):
     """
     Send a text message to Telegram.
     """
-    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("[TELEGRAM] Bot not configured. Skipping message.")
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "your_bot_token_here":
+        print("[TELEGRAM] Bot not configured. Set TELEGRAM_BOT_TOKEN in .env file.")
         return False
     
     try:
@@ -91,8 +84,8 @@ def send_telegram_photo(image, caption=""):
     Send a photo to Telegram.
     image: numpy array (OpenCV frame)
     """
-    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("[TELEGRAM] Bot not configured. Skipping photo.")
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "your_bot_token_here":
+        print("[TELEGRAM] Bot not configured. Set TELEGRAM_BOT_TOKEN in .env file.")
         return False
     
     try:
@@ -286,6 +279,46 @@ class AlertManager:
 🕐 Time: {datetime.now().strftime("%H:%M:%S")}
 
 <i>Monitor situation closely!</i>
+"""
+            if frame is not None:
+                self._send_async(send_telegram_photo, frame, telegram_msg)
+            else:
+                self._send_async(send_telegram_message, telegram_msg)
+    
+    def fight_alert(self, severity, person1_id, person2_id, frame=None):
+        """
+        Trigger fight/aggression detection alert.
+        """
+        if severity < 0.4:
+            return
+        
+        if not self._can_alert("fight"):
+            return
+        
+        level = "CRITICAL" if severity > 0.7 else "WARNING" if severity > 0.5 else "CAUTION"
+        
+        title = f"\U0001f44a FIGHT DETECTED - {level}!"
+        message = f"Severity: {int(severity * 100)}%\nPersons: #{person1_id} vs #{person2_id}\nImmediate intervention required!"
+        
+        # Desktop notification
+        if self.enable_desktop:
+            show_desktop_notification(title, message, timeout=10)
+        
+        # Save image
+        if SAVE_ALERT_IMAGES and frame is not None:
+            self._save_alert_image(frame, "fight")
+        
+        # Telegram (async)
+        if self.enable_telegram:
+            telegram_msg = f"""
+\U0001f44a <b>FIGHT DETECTED</b> \U0001f44a
+
+\u26a0\ufe0f Level: <b>{level}</b>
+\U0001f4ca Severity: <b>{int(severity * 100)}%</b>
+\U0001f464 Persons: #{person1_id} vs #{person2_id}
+\U0001f550 Time: {datetime.now().strftime("%H:%M:%S")}
+
+<i>Immediate intervention required!</i>
 """
             if frame is not None:
                 self._send_async(send_telegram_photo, frame, telegram_msg)

@@ -1,5 +1,12 @@
-# stampede_intel.py - Intelligent Stampede Detection Module
-# Created for Sanjay's Final Year Project
+# stampede_intel.py - Intelligent Stampede Detection Module v2.0
+# For God's Eye Nexus - Crowd Intelligence System
+#
+# Improvements over v1.0:
+# - FPS-normalized velocities (pixels/second instead of pixels/frame)
+# - Counterflow detection (two groups moving toward each other)
+# - Flow reversal detection (sudden direction change = panic trigger)
+# - Faster alert escalation for extreme events
+# - Better acceleration detection using sliding window
 
 import numpy as np
 from collections import deque
@@ -10,19 +17,32 @@ import time
 
 class StampedeDetector:
     """
-    Multi-factor stampede detection system.
+    Multi-factor stampede detection system v2.0.
     
     Instead of just counting people (which gives false alarms),
-    this analyzes BEHAVIOR patterns that indicate real panic.
+    this analyzes BEHAVIOR patterns that indicate real panic:
+    
+    1. Coherence — Is everyone running the same direction? (panic)
+    2. Counterflow — Are two groups colliding head-on? (extremely dangerous)
+    3. Acceleration — Did speed suddenly spike? (flight response)
+    4. Average Speed — How fast is everyone moving? (running vs walking)
+    5. Crowd Spike — Did crowd size suddenly change? (rush/evacuation)
+    6. Edge Pressure — Are people crushed at boundaries? (crushing)
+    7. Flow Reversal — Did the crowd suddenly reverse direction? (panic trigger)
+    
+    All velocities are normalized to pixels/second (FPS-independent).
     """
     
     def __init__(self, history_length=30):
-        self.velocity_history = deque(maxlen=history_length)
+        self.velocity_history = deque(maxlen=history_length)       # speeds per frame
+        self.velocity_vector_history = deque(maxlen=history_length) # full vectors per frame
         self.count_history = deque(maxlen=history_length)
+        self.mean_direction_history = deque(maxlen=history_length)  # for flow reversal
         self.alert_level = 0  # 0=SAFE, 1=CAUTION, 2=WARNING, 3=CRITICAL
         self.prev_positions = {}
+        self.prev_time = time.time()
         
-    def update(self, current_positions, sector_counts, frame_dims):
+    def update(self, current_positions, sector_counts, frame_dims, time_delta=None):
         """
         Call this every frame with current tracking data.
         
@@ -30,46 +50,66 @@ class StampedeDetector:
             current_positions: dict of {track_id: (x, y)}
             sector_counts: numpy array of density per grid cell
             frame_dims: tuple of (width, height)
+            time_delta: seconds since last frame (for FPS-normalization)
         
         Returns:
             dict with risk_score, alert_level, and component breakdown
         """
-        # Calculate velocities from position changes
-        velocities = self._calculate_velocities(current_positions)
+        current_time = time.time()
         
-        # Store for acceleration detection
+        # Calculate time delta if not provided
+        if time_delta is None or time_delta <= 0:
+            time_delta = current_time - self.prev_time
+            if time_delta <= 0:
+                time_delta = 1.0 / 30.0  # fallback to 30 FPS assumption
+        self.prev_time = current_time
+        
+        # Calculate velocities (pixels/second, normalized to FPS)
+        velocities = self._calculate_velocities(current_positions, time_delta)
+        
+        # Store speed history (pixels/second)
         speeds = {tid: np.linalg.norm(v) for tid, v in velocities.items()}
         self.velocity_history.append(speeds)
+        self.velocity_vector_history.append(velocities)
         self.count_history.append(len(current_positions))
         
         # Calculate all component scores (each 0.0 to 1.0)
         coherence = self._calculate_coherence(velocities)
+        counterflow = self._calculate_counterflow(velocities)
         acceleration = self._calculate_acceleration()
         avg_speed = self._calculate_average_speed(speeds)
         spike = self._calculate_crowd_spike()
         edge = self._calculate_edge_pressure(current_positions, frame_dims)
+        flow_reversal = self._calculate_flow_reversal()
         
-        # Weighted combination - coherence is most important!
+        # Store mean direction for flow reversal detection
+        self._store_mean_direction(velocities)
+        
+        # Weighted combination — coherence + counterflow most important
         weights = {
-            'coherence': 0.30,      # Are people moving SAME direction?
-            'acceleration': 0.25,   # Did speed suddenly increase?
-            'avg_speed': 0.20,      # How fast is everyone moving?
-            'spike': 0.15,          # Did crowd size suddenly change?
-            'edge': 0.10            # Are people crushed at edges?
+            'coherence': 0.25,       # Are people moving SAME direction? (panic flight)
+            'counterflow': 0.15,     # Two groups colliding head-on? (extremely dangerous)
+            'acceleration': 0.20,    # Did speed suddenly spike? (flight response)
+            'avg_speed': 0.15,       # How fast is everyone moving? (running)
+            'spike': 0.08,           # Did crowd size suddenly change?
+            'edge': 0.08,            # Crushing at boundaries?
+            'flow_reversal': 0.09    # Sudden direction change? (panic trigger)
         }
         
         raw_score = (
             coherence * weights['coherence'] +
+            counterflow * weights['counterflow'] +
             acceleration * weights['acceleration'] +
             avg_speed * weights['avg_speed'] +
             spike * weights['spike'] +
-            edge * weights['edge']
+            edge * weights['edge'] +
+            flow_reversal * weights['flow_reversal']
         )
         
         # Scale to 0-100
         risk_score = int(raw_score * 100)
         
-        # Update alert level with hysteresis (prevents flickering)
+        # Update alert level with improved escalation
         self._update_alert_level(risk_score)
         
         # Save current positions for next frame
@@ -81,20 +121,28 @@ class StampedeDetector:
             'alert_name': ['SAFE', 'CAUTION', 'WARNING', 'CRITICAL'][self.alert_level],
             'components': {
                 'coherence': round(coherence, 2),
+                'counterflow': round(counterflow, 2),
                 'acceleration': round(acceleration, 2),
                 'avg_speed': round(avg_speed, 2),
                 'spike': round(spike, 2),
-                'edge': round(edge, 2)
+                'edge': round(edge, 2),
+                'flow_reversal': round(flow_reversal, 2)
             }
         }
     
-    def _calculate_velocities(self, current_positions):
-        """Calculate velocity vector for each tracked person"""
+    def _calculate_velocities(self, current_positions, time_delta):
+        """
+        Calculate velocity vector for each tracked person.
+        Returns velocities in PIXELS/SECOND (FPS-independent).
+        """
         velocities = {}
         for track_id, (cx, cy) in current_positions.items():
             if track_id in self.prev_positions:
                 px, py = self.prev_positions[track_id]
-                velocities[track_id] = (cx - px, cy - py)
+                # Normalize to pixels/second
+                vx = (cx - px) / time_delta
+                vy = (cy - py) / time_delta
+                velocities[track_id] = (vx, vy)
         return velocities
     
     def _calculate_coherence(self, velocities):
@@ -110,8 +158,9 @@ class StampedeDetector:
         vectors = np.array(list(velocities.values()))
         magnitudes = np.linalg.norm(vectors, axis=1)
         
-        # Only consider people who are actually moving
-        moving_mask = magnitudes > 3.0
+        # Only consider people who are actually moving (> 30 px/sec ~ slow walk)
+        moving_threshold = 30.0  # pixels/second
+        moving_mask = magnitudes > moving_threshold
         if moving_mask.sum() < 3:
             return 0.0
         
@@ -121,22 +170,81 @@ class StampedeDetector:
         # Normalize to unit vectors (direction only)
         unit_vectors = moving_vectors / moving_mags[:, np.newaxis]
         
-        # Mean direction - if everyone aligned, this has magnitude ~1
+        # Mean direction — if everyone aligned, this has magnitude ~1
         mean_direction = np.mean(unit_vectors, axis=0)
         coherence = np.linalg.norm(mean_direction)
         
-        return float(coherence)
+        return float(min(1.0, coherence))
+    
+    def _calculate_counterflow(self, velocities):
+        """
+        Detect two groups moving in OPPOSITE directions (extremely dangerous).
+        
+        This is a key stampede indicator that v1 missed entirely.
+        If two groups are colliding head-on, coherence would be LOW
+        (directions cancel out), but danger is actually EXTREME.
+        """
+        if len(velocities) < 4:
+            return 0.0
+        
+        vectors = np.array(list(velocities.values()))
+        magnitudes = np.linalg.norm(vectors, axis=1)
+        
+        # Only moving people
+        moving_threshold = 30.0
+        moving_mask = magnitudes > moving_threshold
+        if moving_mask.sum() < 4:
+            return 0.0
+        
+        moving_vectors = vectors[moving_mask]
+        moving_mags = magnitudes[moving_mask]
+        unit_vectors = moving_vectors / moving_mags[:, np.newaxis]
+        
+        # Count opposing pairs using dot product
+        n = len(unit_vectors)
+        opposing_count = 0
+        total_pairs = 0
+        
+        # Sample pairs for efficiency (don't check all O(n²) in large crowds)
+        max_pairs = min(n * (n - 1) // 2, 200)
+        indices = list(range(n))
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                dot = np.dot(unit_vectors[i], unit_vectors[j])
+                total_pairs += 1
+                if dot < -0.5:  # Moving in opposing directions (angle > 120°)
+                    opposing_count += 1
+                if total_pairs >= max_pairs:
+                    break
+            if total_pairs >= max_pairs:
+                break
+        
+        if total_pairs == 0:
+            return 0.0
+        
+        # Ratio of opposing pairs — high ratio = counterflow danger
+        counterflow_ratio = opposing_count / total_pairs
+        
+        # Amplify if many people are involved
+        people_factor = min(1.0, moving_mask.sum() / 8.0)
+        
+        return float(min(1.0, counterflow_ratio * 1.5 * people_factor))
     
     def _calculate_acceleration(self):
-        """Detect sudden collective speed increase"""
-        if len(self.velocity_history) < 10:
+        """
+        Detect sudden collective speed increase.
+        Uses a sliding window comparing recent 5 frames vs previous 10.
+        """
+        if len(self.velocity_history) < 8:
             return 0.0
         
         history = list(self.velocity_history)
         
-        # Average speed in first half vs second half
-        first_half = history[:len(history)//2]
-        second_half = history[len(history)//2:]
+        # Compare recent frames vs earlier frames
+        split = max(3, len(history) * 2 // 3)
+        first_part = history[:split]
+        recent_part = history[split:]
         
         def avg_speed(frames):
             all_speeds = []
@@ -145,31 +253,43 @@ class StampedeDetector:
                     all_speeds.extend(frame.values())
             return np.mean(all_speeds) if all_speeds else 0
         
-        early_speed = avg_speed(first_half)
-        recent_speed = avg_speed(second_half)
+        early_speed = avg_speed(first_part)
+        recent_speed = avg_speed(recent_part)
         
-        if early_speed < 1:
-            early_speed = 1  # Prevent division issues
+        if early_speed < 10:  # pixels/second baseline
+            early_speed = 10
         
         # How much faster is recent movement?
         acceleration_ratio = (recent_speed - early_speed) / early_speed
         
-        # Clamp to 0-1
-        return min(1.0, max(0.0, acceleration_ratio / 2.0))
+        # Also check for absolute speed spike in last 3 frames
+        if len(history) >= 3:
+            last_3_speed = avg_speed(history[-3:])
+            prev_speed = avg_speed(history[:-3]) if len(history) > 3 else early_speed
+            if prev_speed < 10:
+                prev_speed = 10
+            spike_ratio = (last_3_speed - prev_speed) / prev_speed
+            # Take the max of gradual and spike acceleration
+            acceleration_ratio = max(acceleration_ratio, spike_ratio * 0.8)
+        
+        return min(1.0, max(0.0, acceleration_ratio / 1.5))
     
     def _calculate_average_speed(self, speeds):
-        """Normalized average movement speed"""
+        """
+        Normalized average movement speed (in pixels/second).
+        """
         if not speeds:
             return 0.0
         
         avg = np.mean(list(speeds.values()))
         
-        # Normalize: 0 speed = 0, 20+ pixels/frame = 1.0
-        return min(1.0, avg / 20.0)
+        # Normalize: 0 px/s = 0, 200+ px/s = 1.0 (running speed)
+        # At 960px display width, 200 px/s ≈ crossing 1/5 of screen per second
+        return min(1.0, avg / 200.0)
     
     def _calculate_crowd_spike(self):
-        """Detect sudden increase in crowd size"""
-        if len(self.count_history) < 10:
+        """Detect sudden change in crowd size (increase OR decrease = suspicious)."""
+        if len(self.count_history) < 8:
             return 0.0
         
         history = list(self.count_history)
@@ -179,11 +299,12 @@ class StampedeDetector:
         if baseline < 1:
             baseline = 1
         
-        spike_ratio = (recent - baseline) / baseline
-        return min(1.0, max(0.0, spike_ratio))
+        # Both increase AND decrease are concerning
+        change_ratio = abs(recent - baseline) / baseline
+        return min(1.0, max(0.0, change_ratio))
     
     def _calculate_edge_pressure(self, positions, frame_dims):
-        """Detect people clustering at frame edges (crushing)"""
+        """Detect people clustering at frame edges (crushing)."""
         if not positions:
             return 0.0
         
@@ -199,15 +320,90 @@ class StampedeDetector:
         
         return edge_count / len(positions)
     
+    def _store_mean_direction(self, velocities):
+        """Store mean movement direction for flow reversal detection."""
+        if len(velocities) < 2:
+            self.mean_direction_history.append(None)
+            return
+        
+        vectors = np.array(list(velocities.values()))
+        magnitudes = np.linalg.norm(vectors, axis=1)
+        moving_mask = magnitudes > 30.0
+        
+        if moving_mask.sum() < 2:
+            self.mean_direction_history.append(None)
+            return
+        
+        moving_vectors = vectors[moving_mask]
+        mean_dir = np.mean(moving_vectors, axis=0)
+        norm = np.linalg.norm(mean_dir)
+        if norm > 0:
+            self.mean_direction_history.append(mean_dir / norm)
+        else:
+            self.mean_direction_history.append(None)
+    
+    def _calculate_flow_reversal(self):
+        """
+        Detect sudden reversal in crowd flow direction.
+        A crowd that suddenly reverses is a classic panic indicator.
+        """
+        valid_dirs = [d for d in self.mean_direction_history if d is not None]
+        if len(valid_dirs) < 6:
+            return 0.0
+        
+        # Compare recent direction vs older direction
+        older = valid_dirs[:len(valid_dirs)//2]
+        recent = valid_dirs[len(valid_dirs)//2:]
+        
+        if len(older) < 2 or len(recent) < 2:
+            return 0.0
+        
+        old_mean = np.mean(older, axis=0)
+        recent_mean = np.mean(recent, axis=0)
+        
+        old_norm = np.linalg.norm(old_mean)
+        recent_norm = np.linalg.norm(recent_mean)
+        
+        if old_norm < 0.1 or recent_norm < 0.1:
+            return 0.0
+        
+        # Dot product of normalized mean directions
+        dot = np.dot(old_mean / old_norm, recent_mean / recent_norm)
+        
+        # dot = -1 means complete reversal, dot = 1 means same direction
+        # Convert to reversal score (0 = same dir, 1 = full reversal)
+        reversal = max(0.0, -dot)
+        
+        return float(min(1.0, reversal))
+    
     def _update_alert_level(self, risk_score):
-        """Update alert level with hysteresis to prevent flickering"""
-        if risk_score > 65:
-            self.alert_level = min(3, self.alert_level + 1)
-        elif risk_score > 40:
-            if self.alert_level < 2:
+        """
+        Update alert level with improved escalation.
+        
+        v2 improvements:
+        - Allows jumping straight to CRITICAL for extreme scores (> 80)
+        - Faster escalation, gradual de-escalation
+        - Still uses hysteresis to prevent flickering
+        """
+        if risk_score >= 80:
+            # Extreme — jump straight to CRITICAL
+            self.alert_level = 3
+        elif risk_score >= 60:
+            # High — at least WARNING, can escalate to CRITICAL
+            self.alert_level = max(2, min(3, self.alert_level + 1))
+        elif risk_score >= 40:
+            # Moderate — at least CAUTION
+            self.alert_level = max(1, min(2, self.alert_level))
+        elif risk_score >= 25:
+            # Mild — hold current or CAUTION
+            if self.alert_level > 1:
+                self.alert_level -= 1
+            else:
                 self.alert_level = max(1, self.alert_level)
-        elif risk_score < 20:
+        elif risk_score < 15:
+            # Low — de-escalate
             self.alert_level = max(0, self.alert_level - 1)
+        # Between 15-25: hold current level (hysteresis zone)
 
 
 # ============================================================
@@ -606,6 +802,7 @@ class PersonTracker:
         self.match_threshold = match_threshold
         self.tracked_persons = {}
         self.next_custom_id = 10000  # For re-identified persons
+        self.all_seen_ids = set()
         
     def update(self, boxes, ids, frame=None):
         """
@@ -764,6 +961,7 @@ class PersonTracker:
             'reidentified': False,
             'total_time_tracked': 0
         }
+        self.all_seen_ids.add(track_id)
     
     def _update_person(self, track_id, cx, cy, box, appearance, current_time):
         """Update an existing tracked person"""
@@ -773,8 +971,9 @@ class PersonTracker:
         if person['last_pos'] is not None:
             dx = cx - person['last_pos'][0]
             dy = cy - person['last_pos'][1]
-            speed = np.sqrt(dx**2 + dy**2)
-            person['velocity'] = (dx, dy)
+            dt = max(1e-3, current_time - person['last_seen'])
+            speed = np.sqrt(dx**2 + dy**2) / dt
+            person['velocity'] = (dx / dt, dy / dt)
         else:
             speed = 0
             person['velocity'] = (0, 0)
@@ -805,6 +1004,9 @@ class PersonTracker:
         person['path'].append((cx, cy))
         if len(person['path']) > 150:
             person['path'].pop(0)
+    
+    def get_total_unique(self):
+        return len(self.all_seen_ids)
     
     def get_active_persons(self):
         """Get currently visible persons"""
